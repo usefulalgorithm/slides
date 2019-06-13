@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="generator" content="pandoc">
+  <meta name="author" content="Andy Lii">
+  <meta name="dcterms.date" content="2019-06-14">
+  <title>Summarizing Ceph Dedup Paper</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, minimal-ui">
+  <link rel="stylesheet" href="reveal.js/css/reveal.css">
+  <style>
+      code{white-space: pre-wrap;}
+      span.smallcaps{font-variant: small-caps;}
+      span.underline{text-decoration: underline;}
+      div.column{display: inline-block; vertical-align: top; width: 50%;}
+  </style>
+  <link rel="stylesheet" href="reveal.js/css/theme/andy.css" id="theme">
+  <!-- Printing and PDF exports -->
+  <script>
+    var link = document.createElement( 'link' );
+    link.rel = 'stylesheet';
+    link.type = 'text/css';
+    link.href = window.location.search.match( /print-pdf/gi ) ? 'reveal.js/css/print/pdf.css' : 'reveal.js/css/print/paper.css';
+    document.getElementsByTagName( 'head' )[0].appendChild( link );
+  </script>
+  <!--[if lt IE 9]>
+  <script src="reveal.js/lib/js/html5shiv.js"></script>
+  <![endif]-->
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+
+<section id="title-slide">
+  <h1 class="title">Summarizing Ceph Dedup Paper</h1>
+  <p class="author">Andy Lii</p>
+  <p class="date">June 14, 2019</p>
+</section>
+
+<section><section id="things-to-consider" class="title-slide slide level1"><h1>Things to consider</h1></section><section id="cant-apply-traditional-dedup-methods-on-distributed-systems" class="slide level2">
+<h2>Can’t apply traditional dedup methods on distributed systems</h2>
+<p>Data redundancy is why Ceph can guarantee the safety of your data. The concept of dedup is to get rid of redundancy to ensure more efficient space usage though</p>
+</section><section id="cant-decouple-dedup-metadata-and-system-metadata" class="slide level2">
+<h2>Can’t decouple dedup metadata and system metadata</h2>
+<p>What if something breaks when we’re deduping? Can’t guarantee that our ops finished successfully or failed without catastrophic side effects</p>
+</section><section id="fingerprinting-can-be-hard-to-deal-with" class="slide level2">
+<h2>Fingerprinting can be hard to deal with</h2>
+<p>Say each object needs 32 bytes as its fingerprint, all stashed in memory. When data exceeds several PBs we will need a huge memory to store just the fingerprints…</p>
+</section><section id="block-level-dedup-is-definitely-a-viable-choice" class="slide level2">
+<h2>Block level dedup is definitely a viable choice…</h2>
+<p>but dedup ratio is just meh</p>
+</section></section>
+<section><section id="objectives" class="title-slide slide level1"><h1>Objectives</h1></section><section id="scalable-fingerprinting-methods" class="slide level2">
+<h2>Scalable fingerprinting methods</h2>
+</section><section id="integrate-dedup-related-metadata-fields-into-existing-design" class="slide level2">
+<h2>Integrate dedup related metadata fields into existing design</h2>
+</section><section id="as-little-perf-penalty-as-possible" class="slide level2">
+<h2>As little perf penalty as possible</h2>
+</section></section>
+<section><section id="ideas" class="title-slide slide level1"><h1>Ideas</h1></section><section id="double-hashing" class="slide level2">
+<h2>Double hashing</h2>
+<p>Now we just calculate which object lives in which PG, no need to memorize fingerprints in precious memory!</p>
+<p><img data-src="./pics/20190614_1.JPG" /></p>
+</section><section id="self-contained-object" class="slide level2">
+<h2>Self-contained object</h2>
+<p>Instead of coming up with a new DS for metadata dedicated to dedup, why not just add what we need into current implementation?</p>
+<p>Easier said then done… I’m glad the authors seem to have done it. Check xattr of each chunk</p>
+</section><section id="dedup-rate-control" class="slide level2">
+<h2>Dedup rate control</h2>
+<p>They use dedup dedicated threads to do stuff</p>
+</section><section id="selective-post-processing-dedup" class="slide level2">
+<h2>Selective post-processing dedup</h2>
+<p>It’s post-processing because inline dedup interferes with the io too much</p>
+<p>Selectively dedups the not-so-hot objects. The hots ones might be modified very soon so better not dedup them</p>
+</section></section>
+<section><section id="design-the-important-part-imo" class="title-slide slide level1"><h1>Design (The important part IMO)</h1></section><section id="kinds-of-obj" class="slide level2">
+<h2>2 kinds of obj</h2>
+<p>Both have their own set of metadata. We treat them like good ol’ data obj so that they benefit from Ceph’s guarantees</p>
+<ul>
+<li>Metadata objects</li>
+<li>Chunk objects</li>
+</ul>
+</section><section id="metadata-obj" class="slide level2">
+<h2>Metadata obj</h2>
+<ul>
+<li><p>Stored in md pool, contains md for dedup, namely object_manifest_t, which contains chunk_map. Also could possibly store cached chunk data</p></li>
+<li><p>chunk_map: offset range + chunk ID + cached bit + dirty bit</p></li>
+<li><p>offset range &amp; chunk ID: tells you this md obj is comprisd of which chunk objs</p></li>
+<li><p>cached bit: set if chunk data is still with md obj, otherwise if chunk data has been dispatched to chunk obj</p></li>
+<li><p>dirty bit: set if this obj needs dedup</p></li>
+</ul>
+</section><section id="chunk-obj" class="slide level2">
+<h2>Chunk obj</h2>
+<ul>
+<li><p>Stored in chunk pool, contains chunk data and refcount info (pool ID, source obj ID, offset)</p></li>
+<li><p>Chunk obj’s ID is determined by its contents</p></li>
+</ul>
+</section><section id="different-objs-live-in-differet-pools" class="slide level2">
+<h2>Different objs live in differet pools</h2>
+<p>Make chunk objects reside in chunk pool, and metadata objects in metadata pool. Pools can have different replication schemes, use different erasure codes or event different crush rules</p>
+</section><section id="cache-chunks-for-better-availability" class="slide level2">
+<h2>Cache chunks for better availability</h2>
+<p>If a chunk is cached, it is stored within a metadata object. Seems like here a md obj can at most hold only 1 chunk data</p>
+</section><section id="how-to-actually-do-dedup" class="slide level2">
+<h2>How to actually do dedup</h2>
+<ol type="1">
+<li><p>User puts data into system</p></li>
+<li><p>System splits data into chunks and hashes them. The hash value is chunk obj’s ID</p></li>
+<li><p>System hashes chunk obj ID to find which PG the chunk obj should live in, so if two chunks have same contents, their locations are the same so naturally we can distinguish and remove dups</p></li>
+</ol>
+</section><section id="dedup-engine" class="slide level2">
+<h2>Dedup engine</h2>
+<p>Post-processing, done with a background thread</p>
+<ol type="1">
+<li><p>Look for dirty metadata obj. Note all write reqs for a metadata obj are logged into dirty obj ID list</p></li>
+<li><p>Find dirty chunk obj ID from dirty meta obj’s chunk_map</p></li>
+<li><p>If this dirty chunk data does need dedup, engine checks if this chunk already has a chunk obj ID by calculating its hash value. a). If not, then engine gens a chunk obj and sends it to the chunk pool. b). If so, the engine sends a deref msg to old chunk obj and after it’s completed generates a new chunk obj with new chunk obj ID, and sends it to chunk pool.</p></li>
+<li><p>Use CRUSH to determine where the new chunk obj should live. If CRUSH tells us the location already has a chunk, then we’ve found a dup, and increase the already existing chunk’s refcount. Otherwise we just store the new chunk.</p></li>
+<li><p>After the chunk obj has been written to the chunk pool, update metadata obj’s chunk_map. Now we’re done</p></li>
+</ol>
+</section><section id="an-illustration" class="slide level2">
+<h2>An illustration</h2>
+<p><img data-src="./pics/20190614_2.JPG" /></p>
+</section><section id="dedup-rate-control-1" class="slide level2">
+<h2>Dedup rate control</h2>
+<ul>
+<li><p>Control dedup rate to save bandwidth</p>
+<ul>
+<li><p><span class="math inline"><em>I</em><em>O</em><em>P</em><em>S</em> &gt; <strong>h</strong><strong>i</strong></span> : 1 dedup IO per 500 foreground IO</p></li>
+<li><p><span class="math inline"><strong>h</strong><strong>i</strong> ≥ <em>I</em><em>O</em><em>P</em><em>S</em> ≥ <strong>l</strong><strong>o</strong></span> : 1 dedup IO per 100 foreground IO</p></li>
+<li><p><span class="math inline"><em>I</em><em>O</em><em>P</em><em>S</em> &lt; <strong>l</strong><strong>o</strong></span> : no limit for dedup IO</p></li>
+</ul></li>
+</ul>
+</section></section>
+<section><section id="io-path" class="title-slide slide level1"><h1>I/O path</h1></section><section id="write" class="slide level2">
+<h2>Write</h2>
+<ol type="1">
+<li>Client writes obj with fields { id, offset, size, data }</li>
+<li>CRUSH calculate where this obj should live in, then actually writes it to the cluster. If size &lt; chunk_size, cached_bit = F and dirty_bit = T, the missing part is pre-read from the stored chunk obj</li>
+<li>Create chunk_map of this metadata obj and create / add chunk map entries to the chunk_map. Chunk IDs are not yet determined because their fingerprints have not been calculated</li>
+<li>Set cached_bit and dirty_bit to True</li>
+</ol>
+</section><section id="read" class="slide level2">
+<h2>Read</h2>
+<ol type="1">
+<li>Client reads obj with fields { id, offset, size }</li>
+<li>CRUSH finds obj in metadata pool</li>
+<li>Read metadata obj’s chunk_map to find the chunks</li>
+<li>For each chunk…
+<ol type="1">
+<li>If this chunk is cached, read it and return</li>
+<li>Otherwise read chunk ID and send read request to chunk pool with { id, offset, size }. Return if success</li>
+</ol></li>
+</ol>
+</section></section>
+<section><section id="consistency-model" class="title-slide slide level1"><h1>Consistency model</h1></section><section id="section" class="slide level2">
+<h2></h2>
+<p><img data-src="./pics/20190614_3.JPG" /></p>
+</section></section>
+<section><section id="evaluations" class="title-slide slide level1"><h1>Evaluations</h1></section><section id="section-1" class="slide level2">
+<h2></h2>
+<ul>
+<li><p>Performance: caching makes random r/w better. But performance degradation is still quite obvious</p></li>
+<li><p>Space saving: 4X% on real workload (100 VMs deployed with RBD)</p></li>
+<li><p>TL;DR: justifiable IMO</p></li>
+</ul>
+</section></section>
+<section><section id="thoughts" class="title-slide slide level1"><h1>Thoughts</h1></section><section id="section-2" class="slide level2">
+<h2></h2>
+<p>In their current implementation we have to match chunks with metadata objs when we’re writing objects for the first time. This is cumbersome. I suspect there are ways to have Ceph automatically setup everything for us so that we don’t have to worry about chunking, something like setting chunk_size somewhere and just use Ceph commands to split objects into chunks, but currently I haven’t found anything like this.</p>
+</section><section id="section-3" class="slide level2">
+<h2></h2>
+<p>It seems to me that QCS <em>can</em> benefit from dedup. The authors did experiments using Openstack Cinder to deploy tens of Ubuntu VMs, each with 8 GBs of capacity. The dedup ratio is about 50%, so that’s nice.</p>
+</section><section id="section-4" class="slide level2">
+<h2></h2>
+<p>They tested it with Ceph 12.0.2.</p>
+</section></section>
+    </div>
+  </div>
+
+  <script src="reveal.js/lib/js/head.min.js"></script>
+  <script src="reveal.js/js/reveal.js"></script>
+
+  <script>
+
+      // Full list of configuration options available at:
+      // https://github.com/hakimel/reveal.js#configuration
+      Reveal.initialize({
+        // Push each slide change to the browser history
+        history: true,
+
+        // Optional reveal.js plugins
+        dependencies: [
+          { src: 'reveal.js/lib/js/classList.js', condition: function() { return !document.body.classList; } },
+          { src: 'reveal.js/plugin/zoom-js/zoom.js', async: true },
+          { src: 'reveal.js/plugin/notes/notes.js', async: true }
+        ]
+      });
+    </script>
+    </body>
+</html>
